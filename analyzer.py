@@ -94,6 +94,39 @@ def analyze_basic(urls: list[str]) -> list[dict]:
 
 # ── Analyse 2 : Offres ────────────────────────────────────────────────────────
 
+def _extract_offer_count(soup, html_raw: str) -> tuple[bool, int | None]:
+    """
+    Extrait le nombre d'offres avec 3 méthodes en cascade.
+    Retourne (has_offers: bool, count: int | None)
+    """
+    # ── Méthode 1 : data-offers-count sur #filterEngine (le plus fiable)
+    fe = soup.find(id="filterEngine")
+    if fe:
+        v = fe.get("data-offers-count", "")
+        if v and v.isdigit():
+            n = int(v)
+            return n > 0, n
+
+    # ── Méthode 2 : div.result-offers > span.label
+    div = soup.find("div", class_="result-offers")
+    if div:
+        span = div.find("span", class_="label")
+        if span:
+            m = re.search(r"(\d+)", span.get_text())
+            if m:
+                n = int(m.group(1))
+                return n > 0, n
+        return True, None   # div présente mais count non parsé
+
+    # ── Méthode 3 : GTM datalayer (travelSearchResults)
+    m = re.search(r'travelSearchResults\s*=\s*"(\d+)"', html_raw)
+    if m:
+        n = int(m.group(1))
+        return n > 0, n
+
+    return False, None
+
+
 def analyze_offers(urls: list[str]) -> list[dict]:
     rows = []
     for url in urls:
@@ -101,15 +134,17 @@ def analyze_offers(urls: list[str]) -> list[dict]:
         if err:
             rows.append(_error_row(url, err, {"has_offers":False, "count":None}))
             continue
-        div   = soup.find("div", class_="result-offers")
-        count = None
-        if div:
-            span = div.find("span", class_="label")
-            if span:
-                m = re.search(r"(\d+)", span.get_text())
-                count = int(m.group(1)) if m else None
-        rows.append({"url":url, "status":_status(url), "error":None,
-                     "has_offers":bool(div), "count":count})
+
+        html_raw, _ = scrape_page(url)
+        has_offers, count = _extract_offer_count(soup, html_raw)
+
+        rows.append({
+            "url":       url,
+            "status":    _status(url),
+            "error":     None,
+            "has_offers":has_offers,
+            "count":     count,
+        })
     return rows
 
 
