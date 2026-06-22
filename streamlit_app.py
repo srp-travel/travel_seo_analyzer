@@ -9,7 +9,7 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from scraper  import parse_sitemap, scrape_page, get_cache_status, SITEMAP_URL, CACHE_DIR
+from scraper  import parse_sitemap, scrape_page, scrape_batch, get_cache_status, load_cache_index, SITEMAP_URL, CACHE_DIR
 from analyzer import analyze_basic, analyze_offers, analyze_spec, analyze_google_ai, extract_content
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,67 +225,28 @@ with st.sidebar:
         bar  = st.progress(0.0, text=f"0 / {total}")
         info = st.empty()
 
-        # ── Pré-chargement de l'index UNE seule fois ──────────────────────────
-        # Evite les lectures/écritures répétées sur le disque à chaque URL,
-        # ce qui provoquait le double-scraping observé en logs.
-        from scraper import _slug, _decode, _save_index, HEADERS, CACHE_DIR
-        import os, time, requests as _req
-        from datetime import datetime as _dt
-
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        idx = load_cache_index()   # lecture unique
-
-        for i, url in enumerate(urls):
-            filename   = _slug(url)
-            cache_path = os.path.join(CACHE_DIR, filename)
-
-            # Déjà en cache et pas de force → skip sans re-requête
-            if not force and url in idx and os.path.exists(cache_path):
-                icon = "📁"
-            else:
-                time.sleep(0.3)
-                try:
-                    resp   = _req.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-                    status = resp.status_code
-                    html   = f"<!-- HTTP_{status} -->" if status >= 400 else _decode(resp.content)
-                    if status >= 400:
-                        errs.append(f"HTTP {status} · {url}")
-                    icon = "⚠" if status >= 400 else "✓"
-                except Exception as exc:
-                    html, status = f"<!-- SCRAPE_ERROR: {exc} -->", 0
-                    errs.append(f"Erreur · {url} → {exc}")
-                    icon = "✗"
-
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write(html)
-
-                idx[url] = {"file": filename,
-                            "scraped_at": _dt.now().isoformat(),
-                            "status": status}
-
-            pct   = (i + 1) / total
-            short = url.replace("https://voyage.showroomprive.com", "")[:45]
-            bar.progress(pct, text=f"{icon} {i+1}/{total} — {short}")
+        def on_progress(done, tot, url, icon):
+            short = url.replace("https://voyage.showroomprive.com", "")[:50]
+            bar.progress(done / tot, text=f"{icon} {done}/{tot} — {short}")
             info.caption(url)
+            if icon in ("⚠", "✗"):
+                errs.append(f"{icon} {url}")
 
-        # ── Sauvegarde de l'index UNE seule fois à la fin ────────────────────
-        _save_index(idx)
+        scrape_batch(urls, force=force, on_progress=on_progress)
 
         bar.progress(1.0, text="✅ Terminé")
         info.empty()
 
-        ok_count = total - len([e for e in errs if not e.startswith("HTTP 401")])
-        if errs:
-            nb_401 = sum(1 for e in errs if "401" in e)
-            nb_other = len(errs) - nb_401
-            msg = []
-            if nb_401:   msg.append(f"{nb_401} pages en 401 (accès refusé)")
-            if nb_other: msg.append(f"{nb_other} autre(s) erreur(s)")
-            st.warning("⚠ " + " · ".join(msg))
+        nb_401   = sum(1 for e in errs if "401" in e)
+        nb_other = len(errs) - nb_401
+        if nb_401 or nb_other:
+            parts = []
+            if nb_401:   parts.append(f"{nb_401} pages en 401 (accès refusé)")
+            if nb_other: parts.append(f"{nb_other} autre(s) erreur(s)")
+            st.warning("⚠ " + " · ".join(parts))
         else:
-            st.success(f"✅ {total} pages scrappées sans erreur")
+            st.success(f"✅ {total} pages scrappées")
 
-        # Invalider les analyses pour forcer recalcul
         for k in ["data_basic","data_offers","data_spec","data_google_ai","data_content"]:
             st.session_state[k] = None
         st.rerun()
