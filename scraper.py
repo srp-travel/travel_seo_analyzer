@@ -215,6 +215,50 @@ def scrape_page(url: str, force: bool = False) -> tuple[str, bool]:
     return html, False
 
 
+
+def scrape_batch(urls: list[str], force: bool = False, on_progress=None) -> dict:
+    """
+    Scrape optimisé : lit l'index UNE fois, scrape, écrit UNE fois.
+    Evite les double-requêtes et les I/O excessives.
+    on_progress(done, total, url, icon) — optionnel
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    idx = load_cache_index()   # lecture unique
+
+    for i, url in enumerate(urls):
+        filename   = _slug(url)
+        cache_path = os.path.join(CACHE_DIR, filename)
+
+        if not force and url in idx and os.path.exists(cache_path):
+            icon = "📁"  # depuis cache
+        else:
+            time.sleep(0.3)
+            status = 0
+            try:
+                resp   = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+                status = resp.status_code
+                html   = f"<!-- HTTP_{status} -->" if status >= 400 else _decode(resp.content)
+                icon   = "⚠" if status >= 400 else "✓"
+            except Exception as exc:
+                html = f"<!-- SCRAPE_ERROR: {exc} -->"
+                icon = "✗"
+                log.error(f"[scraper] {url} : {exc}")
+
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(html)
+
+            idx[url] = {
+                "file":       filename,
+                "scraped_at": datetime.now().isoformat(),
+                "status":     status,
+            }
+
+        if on_progress:
+            on_progress(i + 1, len(urls), url, icon)
+
+    _save_index(idx)   # écriture unique
+    return idx
+
 def scrape_all(urls: list[str], force: bool = False, on_progress=None) -> dict:
     for i, url in enumerate(urls):
         html, cached = scrape_page(url, force=force)
