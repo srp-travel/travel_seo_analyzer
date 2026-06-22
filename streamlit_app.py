@@ -131,23 +131,19 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def btn_excel(df: pd.DataFrame, filename: str, sheet: str) -> None:
+    """Bouton de téléchargement Excel — clé unique par onglet."""
+    xlsx_data = to_excel(df, sheet)
     st.download_button(
-        label="📥 Télécharger Excel",
-        data=to_excel(df, sheet),
+        label=f"📥 Télécharger Excel ({len(df):,} lignes)",
+        data=xlsx_data,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=filename,
+        key=f"dl_{filename}",
+        use_container_width=True,
     )
 
 def show_table(df: pd.DataFrame, total: int) -> None:
     st.caption(f"{len(df):,} / {total:,} pages affichées")
-    # Normaliser les types pour éviter l'erreur Arrow (mixed int/str)
-    for col in df.columns:
-        if col not in ("URL",):
-            try:
-                df[col] = df[col].where(df[col].notna(), other=None)
-            except Exception:
-                pass
     df = _clean_df(df)
     st.dataframe(
         df,
