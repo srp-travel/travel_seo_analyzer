@@ -115,6 +115,21 @@ def to_excel(df: pd.DataFrame, sheet_name: str) -> bytes:
     wb.save(buf)
     return buf.getvalue()
 
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise les types du DataFrame avant affichage ou export.
+    - Colonnes entières/mixtes → str pour Streamlit/Arrow
+    - None → chaîne vide dans l'affichage
+    """
+    df = df.copy()
+    for col in df.columns:
+        if col in ("URL",):
+            continue
+        # Si colonne mixte (int + str ou None + int) → tout en str sauf si purement numérique
+        if df[col].dtype == object:
+            df[col] = df[col].apply(lambda v: "" if v is None else str(v) if not isinstance(v, str) else v)
+    return df
+
 def btn_excel(df: pd.DataFrame, filename: str, sheet: str) -> None:
     st.download_button(
         label="📥 Télécharger Excel",
@@ -126,8 +141,20 @@ def btn_excel(df: pd.DataFrame, filename: str, sheet: str) -> None:
 
 def show_table(df: pd.DataFrame, total: int) -> None:
     st.caption(f"{len(df):,} / {total:,} pages affichées")
-    st.dataframe(df, use_container_width=True, height=450,
-                 column_config={"URL": st.column_config.LinkColumn()})
+    # Normaliser les types pour éviter l'erreur Arrow (mixed int/str)
+    for col in df.columns:
+        if col not in ("URL",):
+            try:
+                df[col] = df[col].where(df[col].notna(), other=None)
+            except Exception:
+                pass
+    df = _clean_df(df)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        height=450,
+        column_config={"URL": st.column_config.LinkColumn()},
+    )
 
 def filter_df(df: pd.DataFrame, q: str, col_issues: str | None = None,
               col_filter: str | None = None, filter_val: str = "Tout") -> pd.DataFrame:
@@ -178,40 +205,90 @@ with st.sidebar:
     force = st.checkbox("Forcer le re-téléchargement (ignore le cache)")
 
     if st.button("▶ Lancer le scraping", type="primary", use_container_width=True):
+        # ── Auto-chargement des URLs si nécessaire ────────────────────────────
         if not st.session_state.urls:
-            st.error("Chargez d'abord les URLs (étape 1)")
-        else:
-            urls  = st.session_state.urls
-            total = len(urls)
-            errs  = []
-
-            bar   = st.progress(0.0, text=f"0 / {total}")
-            info  = st.empty()
-
-            for i, url in enumerate(urls):
+            with st.spinner("Chargement du sitemap…"):
                 try:
-                    scrape_page(url, force=force)
-                    icon = "✓"
-                except Exception as exc:
-                    errs.append(f"{url} → {exc}")
-                    icon = "⚠"
+                    st.session_state.urls = parse_sitemap(sitemap_url)
+                    if not st.session_state.urls:
+                        st.error("0 URL trouvée dans le sitemap — scraping annulé.")
+                        st.stop()
+                    st.success(f"✅ {len(st.session_state.urls)} URLs chargées automatiquement")
+                except Exception as e:
+                    st.error(f"Impossible de charger le sitemap : {e}")
+                    st.stop()
 
-                pct   = (i + 1) / total
-                short = url.replace("https://voyage.showroomprive.com", "")[:45]
-                bar.progress(pct, text=f"{icon} {i+1}/{total} — {short}")
+        urls  = st.session_state.urls
+        total = len(urls)
+        errs  = []
 
-            bar.progress(1.0, text="✅ Terminé")
-            info.empty()
+        bar  = st.progress(0.0, text=f"0 / {total}")
+        info = st.empty()
 
-            if errs:
-                st.warning(f"⚠ {len(errs)} erreur(s) :\n" + "\n".join(errs[:3]))
+        # ── Pré-chargement de l'index UNE seule fois ──────────────────────────
+        # Evite les lectures/écritures répétées sur le disque à chaque URL,
+        # ce qui provoquait le double-scraping observé en logs.
+        from scraper import _slug, _decode, _save_index, HEADERS, CACHE_DIR
+        import os, time, requests as _req
+        from datetime import datetime as _dt
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        idx = load_cache_index()   # lecture unique
+
+        for i, url in enumerate(urls):
+            filename   = _slug(url)
+            cache_path = os.path.join(CACHE_DIR, filename)
+
+            # Déjà en cache et pas de force → skip sans re-requête
+            if not force and url in idx and os.path.exists(cache_path):
+                icon = "📁"
             else:
-                st.success(f"✅ {total} pages scrappées")
+                time.sleep(0.3)
+                try:
+                    resp   = _req.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+                    status = resp.status_code
+                    html   = f"<!-- HTTP_{status} -->" if status >= 400 else _decode(resp.content)
+                    if status >= 400:
+                        errs.append(f"HTTP {status} · {url}")
+                    icon = "⚠" if status >= 400 else "✓"
+                except Exception as exc:
+                    html, status = f"<!-- SCRAPE_ERROR: {exc} -->", 0
+                    errs.append(f"Erreur · {url} → {exc}")
+                    icon = "✗"
 
-            # Invalider les analyses (données obsolètes)
-            for k in ["data_basic","data_offers","data_spec","data_google_ai","data_content"]:
-                st.session_state[k] = None
-            st.rerun()
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+
+                idx[url] = {"file": filename,
+                            "scraped_at": _dt.now().isoformat(),
+                            "status": status}
+
+            pct   = (i + 1) / total
+            short = url.replace("https://voyage.showroomprive.com", "")[:45]
+            bar.progress(pct, text=f"{icon} {i+1}/{total} — {short}")
+            info.caption(url)
+
+        # ── Sauvegarde de l'index UNE seule fois à la fin ────────────────────
+        _save_index(idx)
+
+        bar.progress(1.0, text="✅ Terminé")
+        info.empty()
+
+        ok_count = total - len([e for e in errs if not e.startswith("HTTP 401")])
+        if errs:
+            nb_401 = sum(1 for e in errs if "401" in e)
+            nb_other = len(errs) - nb_401
+            msg = []
+            if nb_401:   msg.append(f"{nb_401} pages en 401 (accès refusé)")
+            if nb_other: msg.append(f"{nb_other} autre(s) erreur(s)")
+            st.warning("⚠ " + " · ".join(msg))
+        else:
+            st.success(f"✅ {total} pages scrappées sans erreur")
+
+        # Invalider les analyses pour forcer recalcul
+        for k in ["data_basic","data_offers","data_spec","data_google_ai","data_content"]:
+            st.session_state[k] = None
+        st.rerun()
 
     st.markdown("---")
     if st.button("🗑 Vider le cache", use_container_width=True):
@@ -260,7 +337,7 @@ with tab1:
         if data:
             df = pd.DataFrame([{
                 "URL":         r["url"],
-                "Statut":      r.get("status",""),
+                "Statut":      str(str(r.get("status","") or "") or ""),
                 "H1":          status_icon(r.get("h1_ok")),
                 "H1 (valeur)": r.get("h1","")[:80],
                 "Title":       status_icon(r.get("title_ok")),
@@ -289,9 +366,9 @@ with tab2:
         if data:
             df = pd.DataFrame([{
                 "URL":         r["url"],
-                "Statut HTTP": r.get("status",""),
+                "Statut HTTP": str(str(r.get("status","") or "") or ""),
                 "Offres":      "✅ Oui" if r.get("has_offers") else ("⚠ Erreur" if r.get("error") else "❌ Non"),
-                "Nb offres":   r.get("count") if r.get("count") is not None else "",
+                "Nb offres":   r.get("count"),  # None si absent — évite le mixed-type Arrow
                 "Erreur":      r.get("error") or "",
             } for r in data])
             q1, q2 = st.columns([3,2])
@@ -315,7 +392,7 @@ with tab3:
         if data:
             df = pd.DataFrame([{
                 "URL":               r["url"],
-                "Statut HTTP":       r.get("status",""),
+                "Statut HTTP":       str(str(r.get("status","") or "") or ""),
                 "H1":                r.get("h1","")[:120],
                 "Meta Title":        r.get("meta_title","")[:120],
                 "Meta Description":  r.get("meta_desc","")[:160],
@@ -340,7 +417,7 @@ with tab4:
         if data:
             rows = []
             for r in data:
-                row: dict = {"URL":r["url"], "Statut":r.get("status",""), "Score %":r.get("pct","")}
+                row: dict = {"URL":r["url"], "Statut":str(str(r.get("status","") or "") or ""), "Score %":r.get("pct","")}
                 for k,v in r.get("checks",{}).items():
                     row[k] = status_icon(v)
                 row["Problèmes"] = " | ".join(r.get("issues",[]))
@@ -367,7 +444,7 @@ with tab5:
         if data:
             rows = []
             for r in data:
-                row = {"URL":r["url"], "Statut":r.get("status",""),
+                row = {"URL":r["url"], "Statut":str(str(r.get("status","") or "") or ""),
                        "Score %":r.get("pct",""), "Nb mots":r.get("words","")}
                 for k,v in r.get("checks",{}).items():
                     row[k] = status_icon(v)
